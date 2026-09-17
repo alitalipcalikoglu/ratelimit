@@ -100,6 +100,33 @@ examples/                   one walkthrough per feature
 
 With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwarded to the audit service as one event (`success`, or `denied` on 403) with the calling key as actor, the affected entity as target, client IP, user agent and request id. Events are buffered and sent in batches; the audit service being down never fails a request. Actions: see [examples/audit-events.md](examples/audit-events.md).
 
+## Scaling model
+
+One process owns one SQLite file (`instances: 1`). Unlike a naive read-then-write, the check/consume
+path (`checkMany`) wraps the whole read-decide-write sequence in one `BEGIN IMMEDIATE` transaction,
+so quota enforcement itself would stay correct even if two processes shared one file — what would
+diverge is process-local state (`/metrics`' decision tally, each instance's readiness cache), not the
+counters themselves. `release()` has a separate, real limitation: it targets the *current* window at
+release time, not the window the original check consumed, so a release after a window boundary has
+passed does not credit the right bucket. See [docs/READINESS.md](docs/READINESS.md) for the full
+contract.
+
+## Observability
+
+Requests are logged with `reqId` (accepts or generates `X-Request-Id`; no `traceparent` support —
+gateway-only so far). `/health` is a static check; `/ready` pings the database, cached for 10s. Note
+that `/metrics`' `ratelimit_decisions_total` is a process-local counter that resets on restart and
+can disagree with the durable totals `/v1/stats` reports from the `decisions` table. See
+[docs/READINESS.md](docs/READINESS.md) for the full contract.
+
+## Backup / restore
+
+The state to protect is the SQLite file at `DB_PATH` (default `./data/ratelimit.db`, plus WAL
+sidecars while running) — policy and override definitions matter most; counters and hourly
+statistics are comparatively disposable. There is no backup script in this repository; capture the
+file directly and restore by replacing it before starting the service. See
+[docs/READINESS.md](docs/READINESS.md) for the full contract.
+
 ## License
 
 MIT, Ali Talip CALIKOGLU.
