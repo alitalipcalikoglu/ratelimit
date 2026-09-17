@@ -58,7 +58,7 @@ Errors are JSON: `{ "error": { "code", "message", "details?" } }`.
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
-| GET | `/health`, `/ready` | none | Liveness; readiness (database, cached 10 s). |
+| GET | `/health`, `/ready`, `/v1/info` | none | Liveness; readiness (database, cached 10 s); service identity (version, API version, capabilities, schema version, service-core version). |
 | POST | `/v1/check` | check | `{ policy, subject, cost?, peek? }` → decision. |
 | POST | `/v1/check/batch` | check | `{ checks: [{ policy, subject, cost? }], peek? }` → `{ allowed, results }`, all-or-nothing. |
 | POST | `/v1/release` | check | `{ policy, subject, cost?, consumedAt? }` gives units back → state. |
