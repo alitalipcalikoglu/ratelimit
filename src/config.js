@@ -21,6 +21,7 @@ export class Config {
     this.audit = v.audit;
     this.bodyLimit = v.bodyLimit;
     this.dbPath = v.dbPath;
+    this.dbBackupDir = v.dbBackupDir;
     this.apiKeys = v.apiKeys;
     this.rateLimitMax = v.rateLimitMax;
     this.maxLimits = v.maxLimits;
@@ -52,6 +53,7 @@ export class Config {
       audit: parseAudit(r),
       bodyLimit: r.integer('BODY_LIMIT', 65_536, { min: 1_024 }),
       dbPath: r.optional('DB_PATH') || './data/ratelimit.db',
+      dbBackupDir: r.optional('DB_BACKUP_DIR') || undefined,
       apiKeys: Config.#parseApiKeys(r.required('RATELIMIT_API_KEYS')),
       rateLimitMax: r.integer('RATE_LIMIT_MAX', 6_000, { min: 1 }),
       maxLimits: r.integer('MAX_LIMITS', 5, { min: 1, max: 20 }),
