@@ -13,6 +13,7 @@ Scenario-driven walkthroughs of every feature. Requests to `/v1/*` need `Authori
 | [Middleware integration](middleware.md) | A Fastify hook that checks, sets `RateLimit-*` headers, answers 429 and fails open |
 | [API keys and roles](keys-and-roles.md) | check, read, write, readwrite; scoping a key to policies; error codes |
 | [Operations](operations.md) | Health, readiness, metrics, environment, housekeeping, PM2, Docker, backups |
+| [Audit events](audit-events.md) | Which write actions are forwarded to the audit service, event shape, configuration |
 
 Set up once for the examples:
 

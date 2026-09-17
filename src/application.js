@@ -1,4 +1,5 @@
 import { Config } from './config.js';
+import { AuditClient } from './net/audit-client.js';
 import { Database } from './db.js';
 import { RateLimitService } from './domain/rate-limit-service.js';
 import { RateLimitApi } from './http/rate-limit-api.js';
@@ -12,6 +13,7 @@ export class Application {
   /** @param {Config} config */
   constructor(config) {
     this.config = config;
+    this.audit = new AuditClient({ target: config.audit });
     this.db = new Database(config.dbPath);
     this.policies = new PolicyStore(this.db);
     this.overrides = new OverrideStore(this.db);
@@ -39,10 +41,12 @@ export class Application {
 
   async start() {
     const { config } = this;
-    const api = new RateLimitApi({ config, service: this.service, policies: this.policies, overrides: this.overrides, counters: this.counters, db: this.db });
+    const api = new RateLimitApi({ config, audit: this.audit, service: this.service, policies: this.policies, overrides: this.overrides, counters: this.counters, db: this.db });
     const app = await api.build();
     this.app = app;
     this.#installSignalHandlers(app.log);
+    this.audit.logger = app.log;
+    this.audit.start();
     await app.listen({ port: config.port, host: config.host });
     this.worker = new CleanupWorker({ service: this.service, intervalMs: config.cleanupIntervalSec * 1000, logger: app.log });
     this.worker.runOnce();
@@ -64,6 +68,7 @@ export class Application {
     try {
       this.worker?.stop();
       await this.app?.close();
+      await this.audit.close();
       this.db.close();
       clearTimeout(forceExit);
       log.info('shutdown complete');

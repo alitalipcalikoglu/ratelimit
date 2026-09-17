@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
+import { AuditClient } from '../net/audit-client.js';
 import { RateLimitError } from '../domain/errors.js';
 import { ApiKeyAuth } from './api-key-auth.js';
 import { Schemas } from './schemas.js';
@@ -24,9 +25,11 @@ export class RateLimitApi {
    * @param {import('../store/counter-store.js').CounterStore} deps.counters
    * @param {import('../db.js').Database} deps.db
    * @param {import('../types.js').Logger} [deps.logger]
+   * @param {import('../net/audit-client.js').AuditClient} [deps.audit]
    */
-  constructor({ config, service, policies, overrides, counters, db, logger }) {
+  constructor({ config, audit, service, policies, overrides, counters, db, logger }) {
     this.config = config;
+    this.audit = audit;
     this.service = service;
     this.policies = policies;
     this.overrides = overrides;
@@ -61,6 +64,7 @@ export class RateLimitApi {
       }
     });
     app.setErrorHandler(this.#errorHandler);
+    app.addHook('onSend', AuditClient.hook(this.audit));
     app.setNotFoundHandler((_request, reply) => {
       reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'route not found' } });
     });
@@ -160,7 +164,7 @@ export class RateLimitApi {
     });
 
     // ---- policies
-    api.post('/policies', { ...write, schema: { body: Schemas.createPolicy } }, async (request, reply) => {
+    api.post('/policies', { config: { audit: AuditClient.route('ratelimit.policy.create', (_r, b) => ({ type: 'policy', id: b.policy.name })) }, ...write, schema: { body: Schemas.createPolicy } }, async (request, reply) => {
       const b = /** @type {{ name: string, limits: unknown, description?: string }} */ (request.body);
       ApiKeyAuth.assertPolicy(request.apiKey, b.name);
       const row = s.createPolicy(b, request.apiKey.id);
@@ -169,8 +173,8 @@ export class RateLimitApi {
     });
     api.get('/policies', read, async (request) => ({ items: visible(request).map(view) }));
     api.get('/policies/:name', { ...read, schema: { params: Schemas.nameParams } }, async (request) => ({ policy: view(s.getPolicy(name(request))) }));
-    api.patch('/policies/:name', { ...write, schema: { params: Schemas.nameParams, body: Schemas.patchPolicy } }, async (request) => ({ policy: view(s.updatePolicy(name(request), /** @type {any} */ (request.body))) }));
-    api.delete('/policies/:name', { ...write, schema: { params: Schemas.nameParams } }, async (request, reply) => { s.removePolicy(name(request)); return reply.code(204).send(); });
+    api.patch('/policies/:name', { config: { audit: AuditClient.route('ratelimit.policy.update', (r) => ({ type: 'policy', id: /** @type {any} */ (r.params).name }), (r) => ({ patch: r.body })) }, ...write, schema: { params: Schemas.nameParams, body: Schemas.patchPolicy } }, async (request) => ({ policy: view(s.updatePolicy(name(request), /** @type {any} */ (request.body))) }));
+    api.delete('/policies/:name', { config: { audit: AuditClient.route('ratelimit.policy.delete', (r) => ({ type: 'policy', id: /** @type {any} */ (r.params).name })) }, ...write, schema: { params: Schemas.nameParams } }, async (request, reply) => { s.removePolicy(name(request)); return reply.code(204).send(); });
     api.get('/policies/:name/stats', { ...read, schema: { params: Schemas.nameParams, querystring: Schemas.statsQuery } }, async (request) => {
       const r = s.stats(name(request), Number(query(request).hours ?? 24));
       return { ...r, series: r.series.map((x) => ({ hour: Views.iso(x.hourStart), allowed: x.allowed, denied: x.denied })) };
@@ -189,15 +193,15 @@ export class RateLimitApi {
       const offset = Number(q.offset ?? 0);
       return { items: this.overrides.list(n, limit, offset).map((o) => Views.override(o, s.now())), total: this.overrides.count(n), limit, offset };
     });
-    api.put('/policies/:name/overrides/:subject', { ...write, schema: { params: Schemas.subjectParams, body: Schemas.override } }, async (request) => ({ override: Views.override(s.setOverride(name(request), subject(request), /** @type {any} */ (request.body), request.apiKey.id), s.now()) }));
-    api.delete('/policies/:name/overrides/:subject', { ...write, schema: { params: Schemas.subjectParams } }, async (request, reply) => { s.removeOverride(name(request), subject(request)); return reply.code(204).send(); });
+    api.put('/policies/:name/overrides/:subject', { config: { audit: AuditClient.route('ratelimit.override.set', (r) => ({ type: 'subject', id: /** @type {any} */ (r.params).subject }), (r) => ({ policy: /** @type {any} */ (r.params).name, ...(/** @type {object} */ (r.body ?? {})) })) }, ...write, schema: { params: Schemas.subjectParams, body: Schemas.override } }, async (request) => ({ override: Views.override(s.setOverride(name(request), subject(request), /** @type {any} */ (request.body), request.apiKey.id), s.now()) }));
+    api.delete('/policies/:name/overrides/:subject', { config: { audit: AuditClient.route('ratelimit.override.delete', (r) => ({ type: 'subject', id: /** @type {any} */ (r.params).subject }), (r) => ({ policy: /** @type {any} */ (r.params).name })) }, ...write, schema: { params: Schemas.subjectParams } }, async (request, reply) => { s.removeOverride(name(request), subject(request)); return reply.code(204).send(); });
 
     // ---- subjects
     api.get('/policies/:name/subjects/:subject', { ...read, schema: { params: Schemas.subjectParams } }, async (request) => {
       const r = s.usage(name(request), subject(request));
       return { usage: Views.decision(r.decision), override: r.override ? Views.override(r.override, s.now()) : null };
     });
-    api.delete('/policies/:name/subjects/:subject/usage', { ...write, schema: { params: Schemas.subjectParams } }, async (request) => ({ removed: s.resetUsage(name(request), subject(request)) }));
+    api.delete('/policies/:name/subjects/:subject/usage', { config: { audit: AuditClient.route('ratelimit.subject.reset', (r) => ({ type: 'subject', id: /** @type {any} */ (r.params).subject }), (r, b) => ({ policy: /** @type {any} */ (r.params).name, removed: b?.removed })) }, ...write, schema: { params: Schemas.subjectParams } }, async (request) => ({ removed: s.resetUsage(name(request), subject(request)) }));
 
     api.get('/stats', read, async (request) => {
       const items = visible(request).map(view);
