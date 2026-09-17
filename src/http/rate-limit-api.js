@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
-import { createErrorHandler, jsonParser, registerProbes } from '@atc-web/service-core/fastify';
+import { createErrorHandler, jsonParser, registerInfo, registerProbes } from '@atc-web/service-core/fastify';
 import { RateLimitError } from '../domain/errors.js';
 import { ApiKeyAuth } from './api-key-auth.js';
 import { Schemas } from './schemas.js';
@@ -24,16 +24,18 @@ export class RateLimitApi {
    * @param {import('../store/policy-store.js').PolicyStore} deps.policies
    * @param {import('../store/override-store.js').OverrideStore} deps.overrides
    * @param {import('../db.js').Database} deps.db
+   * @param {string} deps.version
    * @param {import('../types.js').Logger} [deps.logger]
    * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
    */
-  constructor({ config, audit, service, policies, overrides, db, logger }) {
+  constructor({ config, audit, service, policies, overrides, db, version, logger }) {
     this.config = config;
     this.audit = audit;
     this.service = service;
     this.policies = policies;
     this.overrides = overrides;
     this.db = db;
+    this.version = version;
     this.logger = logger;
     this.auth = new ApiKeyAuth(config.apiKeys);
   }
@@ -63,6 +65,12 @@ export class RateLimitApi {
       reply.header('cache-control', 'no-store');
     });
     registerProbes(app, () => this.db.ping(), { cacheMs: RateLimitApi.READY_CACHE_MS });
+    registerInfo(app, {
+      service: 'ratelimit',
+      version: this.version,
+      capabilities: ['policy-windows', 'overrides', 'usage-stats'],
+      schemaVersion: this.db.schemaVersion,
+    });
     await app.register((api) => this.#registerV1(api), { prefix: '/v1' });
     await app.register((ops) => this.#registerMetrics(ops));
     return app;

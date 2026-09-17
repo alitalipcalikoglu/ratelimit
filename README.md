@@ -44,6 +44,14 @@ npm run typecheck
 - **Statistics**: allowed and denied per policy per hour, kept `STATS_RETENTION_DAYS`; top consumers per window; one subject's usage.
 - **Keys** are `id:secret[:role[:policies]]` with roles `check` (checks only), `read`, `write`, `readwrite`; a policy scope hides and protects every other policy.
 
+## Boundaries
+
+**Purpose:** shared rate-limit decisions for the platform, primarily consumed by gateway.
+
+**Responsibilities:** policy-based window checks; per-subject overrides/blocks; usage and decision stats.
+
+**Non-responsibilities:** ratelimit ≠ distributed counter backend today — `CounterBackend` is an interface with exactly one implementation (`SqliteCounterBackend`, single SQLite-backed node); it is a seam for a future distributed backend, not a claim that one exists. It does not decide which routes get limited or by which policy — that's gateway's route configuration.
+
 ## API
 
 Errors are JSON: `{ "error": { "code", "message", "details?" } }`.

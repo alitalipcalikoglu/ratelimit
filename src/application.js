@@ -1,5 +1,6 @@
 import { Config } from './config.js';
 import { AuditClient } from '@atc-web/service-core/audit';
+import { readServiceVersion } from '@atc-web/service-core/fastify';
 import { Lifecycle } from '@atc-web/service-core/lifecycle';
 import { Database } from './db.js';
 import { RateLimitService } from './domain/rate-limit-service.js';
@@ -15,6 +16,7 @@ export class Application {
   /** @param {Config} config */
   constructor(config) {
     this.config = config;
+    this.version = readServiceVersion(import.meta.url);
     this.audit = new AuditClient({ target: config.audit });
     this.db = new Database(config.dbPath, { backupDir: config.dbBackupDir });
     this.policies = new PolicyStore(this.db);
@@ -44,7 +46,7 @@ export class Application {
 
   async start() {
     const { config } = this;
-    const api = new RateLimitApi({ config, audit: this.audit, service: this.service, policies: this.policies, overrides: this.overrides, db: this.db });
+    const api = new RateLimitApi({ config, audit: this.audit, service: this.service, policies: this.policies, overrides: this.overrides, db: this.db, version: this.version });
     const app = await api.build();
     this.app = app;
     const { shutdown } = Lifecycle.install({

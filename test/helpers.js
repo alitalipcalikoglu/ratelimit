@@ -46,7 +46,7 @@ export function testService(overrides) {
 /** Fully wired Fastify app. @param {Record<string, string>} [overrides] @param {object} [deps] Extra constructor deps, e.g. an AuditClient. */
 export async function buildApp(overrides, deps = {}) {
   const t = testService(overrides);
-  const app = await new RateLimitApi({ ...t, ...deps, logger: /** @type {any} */ ({ info() {}, warn() {}, error() {}, fatal() {}, debug() {}, trace() {}, child() { return this; } }) }).build();
+  const app = await new RateLimitApi({ version: '0.0.0-test', ...t, ...deps, logger: /** @type {any} */ ({ info() {}, warn() {}, error() {}, fatal() {}, debug() {}, trace() {}, child() { return this; } }) }).build();
   await app.ready();
   return { app, ...t };
 }

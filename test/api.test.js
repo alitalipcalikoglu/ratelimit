@@ -1,15 +1,25 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { readServiceVersion } from '@atc-web/service-core/fastify';
 import { CHECK_KEY, READ_KEY, RW_KEY, SHOP_KEY, WRITE_KEY, bearer, buildApp } from './helpers.js';
 
 const json = (/** @type {import('light-my-request').Response} */ r) => JSON.parse(r.body);
 const API = [{ window: 60, limit: 3 }, { window: 3600, limit: 5 }];
 
 test('API: probes, auth, roles and policy scoping', async (t) => {
-  const { app } = await buildApp();
+  const { app } = await buildApp(undefined, { version: readServiceVersion(import.meta.url) });
   t.after(() => app.close());
   assert.equal((await app.inject({ url: '/health' })).statusCode, 200);
   assert.equal((await app.inject({ url: '/ready' })).statusCode, 200);
+  const info = await app.inject({ url: '/v1/info' });
+  assert.equal(info.statusCode, 200);
+  const infoBody = json(info);
+  assert.deepEqual(
+    [infoBody.service, infoBody.version, infoBody.apiVersion, infoBody.capabilities],
+    ['ratelimit', readServiceVersion(import.meta.url), 'v1', ['policy-windows', 'overrides', 'usage-stats']],
+  );
+  assert.equal(typeof infoBody.schemaVersion, 'number');
+  assert.equal(typeof infoBody.serviceCore, 'string');
   assert.equal((await app.inject({ url: '/v1/policies' })).statusCode, 401);
   assert.equal((await app.inject({ url: '/v1/policies', headers: bearer(CHECK_KEY) })).statusCode, 403, 'check role cannot read');
   assert.equal((await app.inject({ url: '/v1/policies', headers: bearer(WRITE_KEY) })).statusCode, 403);
