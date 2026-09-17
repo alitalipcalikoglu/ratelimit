@@ -18,7 +18,7 @@ export class Schemas {
 
   static check = Schemas.body(['policy', 'subject'], { policy: Schemas.name, subject: Schemas.subject, cost: Schemas.cost, peek: { type: 'boolean' } });
   static checkBatch = Schemas.body(['checks'], { checks: { type: 'array', minItems: 1, maxItems: 100, items: Schemas.body(['policy', 'subject'], { policy: Schemas.name, subject: Schemas.subject, cost: Schemas.cost }) }, peek: { type: 'boolean' } });
-  static release = Schemas.body(['policy', 'subject'], { policy: Schemas.name, subject: Schemas.subject, cost: { type: 'integer', minimum: 1 } });
+  static release = Schemas.body(['policy', 'subject'], { policy: Schemas.name, subject: Schemas.subject, cost: { type: 'integer', minimum: 1 }, consumedAt: { type: 'string', maxLength: 40 } });
   static createPolicy = Schemas.body(['name', 'limits'], { name: Schemas.name, description: Schemas.description, limits: Schemas.limits });
   static patchPolicy = { type: 'object', additionalProperties: false, minProperties: 1, properties: { description: Schemas.description, limits: Schemas.limits } };
   static override = Schemas.body(['limits'], { limits: Schemas.limits, note: Schemas.description, expiresAt: { type: ['string', 'null'], maxLength: 40 } });

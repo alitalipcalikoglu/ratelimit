@@ -110,26 +110,27 @@ code).
   retry a check whose response was lost in transit, since it cannot tell from the retry alone whether
   the original attempt was already charged.
 - **`POST /v1/release` is idempotent only in the narrow sense that repeating it keeps subtracting**
-  — it is not idempotent in the "safe to retry" sense: `counters.release` runs
-  `UPDATE counters SET count = MAX(0, count - ?) WHERE ...`, floored at zero, so calling `release`
-  twice for the same original check will not go negative, but it also does not detect that it has
-  already been applied — see the window-boundary limitation below, which is the more serious caveat.
+  — it is not idempotent in the "safe to retry" sense: `CounterBackend.release` clamps at zero, so
+  calling `release` twice for the same original check will not go negative, but it also does not
+  detect that it has already been applied — see "release() and the window-boundary fix" below.
 
-**`release()`'s window-boundary limitation** (verified in `src/domain/rate-limit-service.js`):
-`release(input)` computes `now = this.now()` **at release time**, resolves the effective limits, and
-for each window calls `this.counters.release(row.name, input.subject, l.window,
-SlidingWindow.start(l, now), cost)` — `SlidingWindow.start(l, now)` is the **current** fixed-window
-bucket as of the release call, not the bucket that was actually incremented by the original
-`check()`/`checkMany()` call. If `release()` is called while still inside the same fixed window as
-the original consuming check, this correctly targets and decrements that same bucket. **If enough
-time has passed that `now` has rolled into a new fixed window since the original check, `release()`
-silently targets the wrong bucket**: either a row that doesn't exist yet (the `UPDATE` matches zero
-rows — a harmless no-op) or an existing row from unrelated requests already made in the new window
-(which then get erroneously decremented instead of the request that's actually being released). In
-neither case does the original over-consumed window's counter ever get corrected — the released
-units are effectively lost once a window boundary has passed between check and release. There is no
-guard, warning, or documentation of this in the code itself; it is a real, currently-true limitation
-of the release path, not a hypothetical.
+**`release()` and the window-boundary fix (Stage 5).** Before Stage 5, `release(input)` computed
+`now` **at release time** and decremented whichever fixed window `now` fell in — not the window the
+original `check()`/`checkMany()` call had actually incremented. Inside the same window as the
+original check this happened to be the same bucket, so it worked by coincidence; once a window
+boundary passed between check and release, the refund silently landed on the wrong bucket (an
+empty one, a harmless no-op) or on an unrelated one (decrementing someone else's legitimate usage).
+Every `Decision` (from `check`/`checkMany`) now carries `consumedAt` — the instant it was evaluated,
+and, when it consumed, the instant it consumed at. `release()` takes an optional `consumedAt`
+(`src/domain/rate-limit-service.js`, `CounterBackend.release`,
+`src/store/sqlite-counter-backend.js`) and decrements the window `consumedAt` falls in, not
+whichever window `now` is in — deterministic regardless of how long the release is delayed. A
+caller that omits `consumedAt` gets the pre-fix behavior by construction (targets the current
+window), which remains correct exactly when the release happens inside the same window it
+consumed; nothing about the fix requires every caller to be updated at once. A counter is clamped
+at zero on every release regardless of `consumedAt`, cost, or how many times it is called — see
+`test/backend-contract.test.js` ("release restores the same window…", "release after a window
+rollover…", "duplicate and excess release…") and `test/service.test.js` for the regression proof.
 
 ## Backup
 State that must survive a disk loss: the SQLite file at `DB_PATH` (default `./data/ratelimit.db`)
@@ -200,30 +201,54 @@ already states this explicitly ("Distributed counters across several instances o
 process owns one database").
 
 **The check/consume path specifically is safe under two processes sharing one file**, which is a
-materially different answer from `shortlink`'s redirect path. `checkMany()` wraps the *entire*
-read-decide-write sequence — reading policy/override definitions, reading the current and previous
-window counters (`counters.pair`), evaluating every window, and (only if every window allows the
-cost) writing the new counts (`counters.add`) and the hourly decision tally (`counters.decide`) — in
-one call to `this.db.transaction()`, which issues `BEGIN IMMEDIATE` *before* any of those reads
-happen. `BEGIN IMMEDIATE` acquires SQLite's RESERVED lock immediately, at the start of the
-transaction, not deferred until the first write; only one such transaction can hold that lock at a
-time, across the whole database file, including across separate OS processes connected to the same
-file. This means a second process's `checkMany()` cannot begin *its* `BEGIN IMMEDIATE` transaction
-— and therefore cannot read the counters — until the first process's transaction has fully committed
-or rolled back. There is no window, within or across processes, where two `checkMany()` calls for
-the same (or different) subjects can interleave their read and write halves — unlike `shortlink`'s
-`follow()`, where the `maxClicks` read happens *outside* the transaction that performs the write.
+materially different answer from `shortlink`'s redirect path. `RateLimitService` never touches
+SQLite directly (Stage 5: it depends on the `CounterBackend` interface,
+`src/domain/counter-backend.js`, only). `SqliteCounterBackend.checkAndConsume`
+(`src/store/sqlite-counter-backend.js`) wraps the *entire* read-decide-write sequence — reading the
+current and previous window counters for every limit of every check in the batch (`counters.pair`),
+evaluating every one of them, and (only if every check's every limit allows its cost) writing the
+new counts (`counters.add`) — in one call to `db.transaction()`, which issues `BEGIN IMMEDIATE`
+*before* any of those reads happen; policy/override resolution stays in `RateLimitService` and reads
+`policies`/`overrides` outside this transaction (those rows change far less often than counters and
+were never part of this atomicity requirement). `BEGIN IMMEDIATE` acquires SQLite's RESERVED lock
+immediately, at the start of the transaction, not deferred until the first write; only one such
+transaction can hold that lock at a time, across the whole database file, including across separate
+OS processes connected to the same file. This means a second process's `checkAndConsume` cannot
+begin *its* `BEGIN IMMEDIATE` transaction — and therefore cannot read the counters — until the first
+process's transaction has fully committed or rolled back. There is no window, within or across
+processes, where two `checkAndConsume` calls for the same (or different) subjects can interleave
+their read and write halves — unlike `shortlink`'s `follow()`, where the `maxClicks` read happens
+*outside* the transaction that performs the write. This is exercised with REAL cross-connection
+concurrency (separate `node:worker_threads`, each with its own `DatabaseSync` against the same
+file, not same-process `Promise.all`) in `test/concurrency.test.js`.
 
 Where two processes *would* cause a real problem: the **cleanup worker running in two processes**
-is not itself unsafe in the sense of corrupting data (`RateLimitService.cleanup()` is also wrapped
-in `db.transaction()`, and every statement inside it — `DELETE FROM counters WHERE …`, `DELETE FROM
-overrides WHERE …`, `DELETE FROM decisions WHERE …` — is naturally idempotent: deleting rows that
-another process already deleted just matches zero rows). The real problem with two instances is
-entirely the **process-local state**, not the database: `RateLimitService.tally` (the source of
-`ratelimit_decisions_total` in `/metrics`) and the readiness cache would each be independent per
-process, so `/metrics` and `/ready` would report different, incomplete pictures depending on which
-instance answered a given request — exactly the same class of issue `flags` has with its own
-per-process evaluation cache and counters, not a data-correctness issue.
+is not itself unsafe in the sense of corrupting data. `RateLimitService.cleanup()` (Stage 5) no
+longer wraps its three deletions (`backend.cleanup` for counters, `overrides.deleteExpired`,
+`backend.cleanupDecisions`) in one shared transaction — a swappable `CounterBackend` cannot share a
+SQL transaction with the separate `OverrideStore`, so this atomicity is a casualty of the backend
+abstraction itself, documented in `RateLimitService.cleanup`'s own JSDoc. Each of the three remains
+its own atomic single-SQL-statement operation, and each is naturally idempotent (deleting rows
+already deleted — by this process or another — just matches zero rows), so two processes' cleanup
+workers running concurrently, or one process's cleanup crashing partway through, never corrupts
+data or double-deletes; the only consequence is that a run can leave one of the three steps until
+the next interval. The real problem with two instances is entirely the **process-local state**, not
+the database: `RateLimitService.tally` (the source of `ratelimit_decisions_total` in `/metrics`) and
+the readiness cache would each be independent per process, so `/metrics` and `/ready` would report
+different, incomplete pictures depending on which instance answered a given request — exactly the
+same class of issue `flags` has with its own per-process evaluation cache and counters, not a
+data-correctness issue.
+
+**Redis-readiness (reviewed, not implemented — Stage 5 explicitly stops here).** A Redis-backed
+`CounterBackend` would need exactly one atomic server-side operation in place of
+`checkAndConsume`'s SQLite transaction: a Lua script (or Redis Function) that, given every check in
+the batch, reads `prev`/`cur` for every limit, evaluates all of them, and issues every limit's
+`INCRBY` only if every one of them allows its cost — anything short of one atomic operation across
+the whole batch reintroduces the exact partial-consumption bug the SQLite transaction exists to
+prevent. `release()` needs a second, simpler atomic operation: a bounded `DECRBY` (clamped at zero)
+against the window `consumedAt` selects. `domain/counter-backend.js` documents the atomicity
+contract in backend-agnostic terms (no Redis-specific concepts leak into the interface); a Redis
+implementation is expected to satisfy `test/backend-contract.test.js` unchanged.
 
 ## Single-node / multi-node guarantees
 Running two `ratelimit` instances against the same `DB_PATH` is not a topology this repository ships
@@ -233,13 +258,17 @@ jointly over-spend a policy's quota — **does not apply here**: `BEGIN IMMEDIAT
 read-then-write sequence serializes it globally, so quota enforcement itself would remain correct
 under two processes. What would *not* be correct is anything reading `RateLimitService.tally`
 (`/metrics`'s `ratelimit_decisions_total`) or each process's own 10s readiness cache, since those are
-per-process and not coordinated. `release()`'s window-boundary limitation (above) exists regardless
-of instance count — it is a single-process bug in effect, not a concurrency one.
+per-process and not coordinated. `release()`'s window-boundary behavior (above) is unrelated to
+instance count either way — with `consumedAt` supplied it is correct under any instance count for
+the same reason `checkAndConsume` is; without it, it targets the current window regardless of how
+many processes are involved.
 
 ## Known failure modes
-- **Disk full**: a write inside `db.transaction()` (check, release, policy/override write, cleanup)
-  throws, rolls back, and the request fails `500`; no partial charge is possible because the whole
-  check-and-consume sequence is one transaction.
+- **Disk full**: a write inside `db.transaction()` (check, release, policy/override write) throws,
+  rolls back, and the request fails `500`; no partial charge is possible because the whole
+  check-and-consume sequence is one transaction. `cleanup()` (Stage 5: three separate atomic
+  statements, not one shared transaction — see Scaling model) can fail partway through; the next
+  interval's run picks up whatever step didn't complete, since every step is idempotent.
 - **Audit service times out or is unreachable mid-request**: no effect on the ratelimit request —
   `record()` is a synchronous in-memory push; network I/O is deferred to the background timer. Long
   enough downtime drops events once `MAX_BUFFER = 5_000` is hit.
@@ -252,7 +281,12 @@ of instance count — it is a single-process bug in effect, not a concurrency on
   `shortlink`), but `/metrics`' `ratelimit_decisions_total` and each instance's own readiness cache
   would diverge between the two processes, giving an operator an incomplete picture depending on
   which instance answers a given `/metrics` or `/ready` poll.
-- **`release()` called after a window boundary has passed since the original check**: as detailed
-  above, the released units are not credited back to the window that was actually over-consumed —
-  they are either a no-op or, worse, an erroneous decrement against a different, unrelated window's
-  legitimate usage. This is a real, currently-true limitation, not a hypothetical edge case.
+- **`release()` called after a window boundary has passed since the original check, with
+  `consumedAt` supplied**: correctly credits the window that was actually over-consumed (Stage 5
+  fix) — see "release() and the window-boundary fix" above.
+- **`release()` called without `consumedAt`, after a window boundary has passed**: targets the
+  *current* window, same as every release before Stage 5 — either a no-op (nothing to decrement
+  there yet) or, if unrelated requests already used that new window, an erroneous decrement against
+  their legitimate usage. Callers that care about a release outliving its window must pass back the
+  `consumedAt` their check returned; this is a caller-must-opt-in behavior, not a hidden trap, since
+  omitting the field is exactly the pre-Stage-5 default.

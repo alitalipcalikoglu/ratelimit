@@ -101,3 +101,64 @@ test('Service: usage, reset, top, stats, cleanup and policy removal', () => {
   service.createPolicy({ name: 'x', limits: [{ window: 1, limit: 1 }] }, 'admin');
   assert.throws(() => service.createPolicy({ name: 'x', limits: [{ window: 1, limit: 1 }] }, 'admin'), (e) => e instanceof RateLimitError && e.code === 'POLICY_EXISTS');
 });
+
+// Stage 5: release() must decrement the window that was actually consumed, not whichever window
+// `now` happens to be in at release time (the bug documented in ARCHITECTURE_AUDIT.md / README's
+// old "Scaling model" text, `rate-limit-service.js:162` before this stage).
+test('Service: release() targets the consumed window, not the release-time window', () => {
+  const { service, clock, counters } = testService();
+  service.createPolicy({ name: 'api', limits: [{ window: 60, limit: 3 }] }, 'admin');
+  const windowStart0 = Math.floor(T / 60_000) * 60_000;
+  const windowStart1 = windowStart0 + 60_000;
+
+  const consumed = service.check({ policy: 'api', subject: 'u1' });
+  assert.equal(consumed.allowed, true);
+  assert.equal(counters.pair('api', 'u1', 60, windowStart0).cur, 1, 'consumed in window 0');
+
+  // Clock crosses the window boundary before the release arrives.
+  clock.t = windowStart1;
+  assert.equal(service.usage('api', 'u1').decision.remaining, 2, 'window 0 still weighs fully at the exact boundary');
+
+  const released = service.release({ policy: 'api', subject: 'u1', consumedAt: new Date(consumed.consumedAt).toISOString() });
+  assert.equal(counters.pair('api', 'u1', 60, windowStart0).cur, 0, 'window 0 is credited back, not window 1');
+  assert.equal(counters.pair('api', 'u1', 60, windowStart1).cur, 0, 'window 1 was never touched');
+  assert.equal(released.remaining, 3, 'full limit available again');
+  assert.equal(service.usage('api', 'u1').decision.remaining, 3);
+});
+
+test('Service: release() without consumedAt keeps the pre-Stage-5 current-window behavior', () => {
+  const { service, clock, counters } = testService();
+  service.createPolicy({ name: 'api', limits: [{ window: 60, limit: 3 }] }, 'admin');
+  const windowStart0 = Math.floor(T / 60_000) * 60_000;
+  const windowStart1 = windowStart0 + 60_000;
+
+  service.check({ policy: 'api', subject: 'u1' });
+  clock.t = windowStart1;
+  service.release({ policy: 'api', subject: 'u1' }); // no consumedAt: targets "now"'s window, same as before Stage 5
+  assert.equal(counters.pair('api', 'u1', 60, windowStart0).cur, 1, 'window 0 is untouched: the refund is effectively lost, same as pre-fix behavior');
+  assert.equal(counters.pair('api', 'u1', 60, windowStart1).cur, 0, 'window 1 has nothing to release, clamped at 0');
+});
+
+test('Service: release() never takes a counter negative, however many times it is called', () => {
+  const { service, counters } = testService();
+  service.createPolicy({ name: 'api', limits: [{ window: 60, limit: 3 }] }, 'admin');
+  service.check({ policy: 'api', subject: 'u1' });
+  for (let i = 0; i < 5; i++) service.release({ policy: 'api', subject: 'u1', cost: 2 });
+  const windowStart0 = Math.floor(T / 60_000) * 60_000;
+  assert.equal(counters.pair('api', 'u1', 60, windowStart0).cur, 0);
+  assert.equal(service.usage('api', 'u1').decision.remaining, 3);
+  assert.throws(() => service.release({ policy: 'api', subject: 'u1', consumedAt: 'not a date' }), (e) => e instanceof RateLimitError && e.code === 'INVALID_CONSUMED_AT');
+});
+
+test('Service: release() interacts correctly with the sliding estimate across a boundary', () => {
+  const { service, clock } = testService();
+  service.createPolicy({ name: 'api', limits: [{ window: 60, limit: 10 }] }, 'admin');
+  const windowStart0 = Math.floor(T / 60_000) * 60_000;
+  for (let i = 0; i < 4; i++) service.check({ policy: 'api', subject: 'u1' });
+  const last = service.check({ policy: 'api', subject: 'u1' });
+  // 30s into window 1: window 0 still weighs 50%.
+  clock.t = windowStart0 + 90_000;
+  assert.equal(service.usage('api', 'u1').decision.limits[0].used, 2.5);
+  service.release({ policy: 'api', subject: 'u1', consumedAt: new Date(last.consumedAt).toISOString() });
+  assert.equal(service.usage('api', 'u1').decision.limits[0].used, 2, '4 left in window 0, weighted at 50%');
+});

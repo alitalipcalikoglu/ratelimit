@@ -71,6 +71,15 @@
  */
 
 /**
+ * @typedef {object} ReleaseInput
+ * @property {string} policy
+ * @property {string} subject
+ * @property {number} [cost]        Units to give back, default 1.
+ * @property {string} [consumedAt]  ISO 8601 instant the units were originally consumed at; default
+ *   now (matches the pre-Stage-5 behavior of always targeting the current window).
+ */
+
+/**
  * State of one window for one subject at one instant.
  * @typedef {object} LimitState
  * @property {number} window
@@ -95,6 +104,9 @@
  * @property {number} resetAt
  * @property {number|null} retryAfter
  * @property {LimitState[]} limits
+ * @property {number} consumedAt   The instant this decision was evaluated at (ms since epoch); when
+ *   `allowed` and not a peek, the instant consumed. Pass back as `release()`'s `consumedAt` so the
+ *   release targets the window that was actually consumed, even after it has rolled over.
  */
 
 /** @typedef {import('fastify').FastifyBaseLogger} Logger */

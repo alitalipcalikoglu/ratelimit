@@ -10,6 +10,7 @@ export class RateLimitError extends Error {
     INVALID_LIMITS: 400,
     COST_TOO_HIGH: 400,
     DUPLICATE_CHECK: 400,
+    INVALID_CONSUMED_AT: 400,
     UNKNOWN_WINDOW: 400,
     FORBIDDEN: 403,
   };

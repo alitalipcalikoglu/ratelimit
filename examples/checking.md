@@ -18,6 +18,7 @@ rcurl -X POST $RL/v1/check -d '{ "policy": "api", "subject": "key_7f3a" }'
   "remaining": 99,
   "resetAt": "2026-09-17T10:01:00.000Z",
   "retryAfter": 0,
+  "consumedAt": "2026-09-17T10:00:03.000Z",
   "limits": [
     { "window": 60, "limit": 100, "used": 1, "remaining": 99, "allowed": true, "resetAt": "2026-09-17T10:01:00.000Z", "retryAfter": 0 },
     { "window": 86400, "limit": 20000, "used": 1, "remaining": 19999, "allowed": true, "resetAt": "2026-09-18T00:00:00.000Z", "retryAfter": 0 }
@@ -30,6 +31,7 @@ rcurl -X POST $RL/v1/check -d '{ "policy": "api", "subject": "key_7f3a" }'
 - `remaining` is what is left after this call. `used` is the sliding estimate before it.
 - `retryAfter` is seconds until a request of the same cost fits again; `0` when allowed, `null` when the subject is [blocked](overrides.md).
 - `source` is `override` when a per-subject override was applied.
+- `consumedAt` is the instant this decision was evaluated at (and, when allowed and not a peek, the instant consumed). Keep it if you might need to [release](release.md) this check later — the release decrements the window it names, not whichever window is current when the release call arrives.
 
 ## Denied
 

@@ -57,6 +57,7 @@ test('API: policy lifecycle, checks, batch, release, overrides, usage, top, stat
 
   res = await app.inject({ method: 'POST', url: '/v1/release', headers: bearer(CHECK_KEY), payload: { policy: 'api', subject: '203.0.113.7' } });
   assert.deepEqual([res.statusCode, json(res).remaining], [200, 1]);
+  assert.ok(json(res).consumedAt, 'a release response also carries a consumedAt (the instant it was evaluated at)');
 
   assert.equal((await app.inject({ method: 'POST', url: '/v1/policies', headers: bearer(WRITE_KEY), payload: { name: 'login', limits: [{ window: 60, limit: 1 }] } })).statusCode, 201);
   const batch = { checks: [{ policy: 'api', subject: 'u9' }, { policy: 'login', subject: 'u9' }] };
@@ -105,4 +106,19 @@ test('API: policy lifecycle, checks, batch, release, overrides, usage, top, stat
   assert.equal((await app.inject({ method: 'DELETE', url: '/v1/policies/api', headers: bearer(WRITE_KEY) })).statusCode, 204);
   assert.equal((await app.inject({ url: '/v1/policies/api', headers: bearer(READ_KEY) })).statusCode, 404);
   assert.equal((await check({ policy: 'api', subject: 'x' }, RW_KEY)).statusCode, 404);
+});
+
+test('API: release consumedAt round-trip across a window boundary', async (t) => {
+  const { app, clock } = await buildApp();
+  t.after(() => app.close());
+  await app.inject({ method: 'POST', url: '/v1/policies', headers: bearer(WRITE_KEY), payload: { name: 'api', limits: [{ window: 60, limit: 3 }] } });
+  const res = await app.inject({ method: 'POST', url: '/v1/check', headers: bearer(CHECK_KEY), payload: { policy: 'api', subject: 'u1' } });
+  const consumedAt = json(res).consumedAt;
+  assert.ok(consumedAt, 'check() response carries consumedAt');
+  clock.t += 60_000; // cross the window boundary before releasing
+  const released = await app.inject({ method: 'POST', url: '/v1/release', headers: bearer(CHECK_KEY), payload: { policy: 'api', subject: 'u1', consumedAt } });
+  assert.equal(json(released).remaining, 3, 'passing back consumedAt credits the window that was actually consumed');
+
+  const bad = await app.inject({ method: 'POST', url: '/v1/release', headers: bearer(CHECK_KEY), payload: { policy: 'api', subject: 'u1', consumedAt: 'not a date' } });
+  assert.deepEqual([bad.statusCode, json(bad).error.code], [400, 'INVALID_CONSUMED_AT']);
 });

@@ -33,7 +33,7 @@ export class RateLimitClient {
   /** @param {{ policy: string, subject: string, cost?: number }[]} checks */
   checkMany(checks) { return this.#post('/v1/check/batch', { checks }); }
 
-  /** @param {{ policy: string, subject: string, cost?: number }} release */
+  /** @param {{ policy: string, subject: string, cost?: number, consumedAt?: string }} release */
   release(release) { return this.#post('/v1/release', release); }
 }
 ```

@@ -31,6 +31,6 @@ export class Views {
 
   /** @param {Decision} d */
   static decision(d) {
-    return { ...d, resetAt: Views.iso(d.resetAt), limits: d.limits.map((l) => ({ ...l, resetAt: Views.iso(l.resetAt) })) };
+    return { ...d, resetAt: Views.iso(d.resetAt), consumedAt: Views.iso(d.consumedAt), limits: d.limits.map((l) => ({ ...l, resetAt: Views.iso(l.resetAt) })) };
   }
 }

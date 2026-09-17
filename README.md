@@ -38,7 +38,7 @@ npm run typecheck
 
 - **A policy** (`api`, `login`, `sms`) is a list of windows: at most `limit` units per `window` seconds. A check passes only when every window has room for the cost; then every window is charged, in one transaction. Denied checks consume nothing.
 - **A subject** is any string the caller chooses: an API key id, a user id, an IP, a hashed phone number. The service stores it as given.
-- **A check** answers `allowed`, plus `limit`, `remaining`, `resetAt` and `retryAfter` for the most restrictive window and the state of every window. `cost` charges more than one unit; `peek` answers without charging. A **batch** checks several policies all-or-nothing. A **release** gives units back after work that failed.
+- **A check** answers `allowed`, plus `limit`, `remaining`, `resetAt`, `retryAfter` and `consumedAt` for the most restrictive window and the state of every window. `cost` charges more than one unit; `peek` answers without charging. A **batch** checks several policies all-or-nothing. A **release** gives units back after work that failed — pass the check's `consumedAt` back as `release`'s `consumedAt` so the release credits the window that was actually charged, even after it has rolled over; omitting it releases against the *current* window, same as calling it right away.
 - **An override** replaces the policy's windows for one subject (a partner's larger quota, a smaller plan) and can expire; a limit of `0` blocks the subject.
 - **Sliding window**: two counters per subject and window, current and previous fixed window, weighted by overlap. No request log, no double burst at window boundaries; `retryAfter` accounts for the decay.
 - **Statistics**: allowed and denied per policy per hour, kept `STATS_RETENTION_DAYS`; top consumers per window; one subject's usage.
@@ -53,7 +53,7 @@ Errors are JSON: `{ "error": { "code", "message", "details?" } }`.
 | GET | `/health`, `/ready` | none | Liveness; readiness (database, cached 10 s). |
 | POST | `/v1/check` | check | `{ policy, subject, cost?, peek? }` → decision. |
 | POST | `/v1/check/batch` | check | `{ checks: [{ policy, subject, cost? }], peek? }` → `{ allowed, results }`, all-or-nothing. |
-| POST | `/v1/release` | check | `{ policy, subject, cost? }` gives units back → state. |
+| POST | `/v1/release` | check | `{ policy, subject, cost?, consumedAt? }` gives units back → state. |
 | POST | `/v1/policies` | write | `{ name, description?, limits }` → `201 { policy }`. |
 | GET | `/v1/policies`, `/v1/policies/:name` | read | Visible policies with overrides, active subjects and 24 h totals; one policy. |
 | PATCH / DELETE | `/v1/policies/:name` | write | `{ description?, limits? }`; delete with overrides, counters and statistics. |
@@ -81,9 +81,10 @@ src/
   application.js            composition root, lifecycle, cleanup worker
   worker.js                 CleanupWorker: stale counters, expired overrides, old statistics
   domain/limits.js          limit list validation
-  domain/sliding-window.js  the estimate, remaining and retry hints
+  domain/sliding-window.js  the estimate, remaining and retry hints; shared by every counter backend
+  domain/counter-backend.js the CounterBackend contract; no SQLite in this file
   domain/rate-limit-service.js  policies, overrides, checks, batches, releases, usage, top, stats
-  store/                    PolicyStore, OverrideStore, CounterStore (counters + hourly decisions)
+  store/                    PolicyStore, OverrideStore, CounterStore (raw SQL), SqliteCounterBackend
   http/rate-limit-api.js    Fastify routes, error mapping, probes, metrics
   http/api-key-auth.js      constant-time bearer auth, roles, policy scope
 test/                       node:test suites (config, domain, service, API, TLS)
@@ -102,14 +103,59 @@ With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwa
 
 ## Scaling model
 
-One process owns one SQLite file (`instances: 1`). Unlike a naive read-then-write, the check/consume
-path (`checkMany`) wraps the whole read-decide-write sequence in one `BEGIN IMMEDIATE` transaction,
-so quota enforcement itself would stay correct even if two processes shared one file — what would
-diverge is process-local state (`/metrics`' decision tally, each instance's readiness cache), not the
-counters themselves. `release()` has a separate, real limitation: it targets the *current* window at
-release time, not the window the original check consumed, so a release after a window boundary has
-passed does not credit the right bucket. See [docs/READINESS.md](docs/READINESS.md) for the full
-contract.
+One process owns one SQLite file (`instances: 1`). `RateLimitService` (the domain layer: policies,
+overrides, the "most restrictive window" logic) depends only on a `CounterBackend` interface
+(`domain/counter-backend.js`) — it holds no SQL, no transaction object, nothing SQLite-specific.
+`SqliteCounterBackend` (`store/sqlite-counter-backend.js`) is the only implementation: it wraps
+`CounterStore` (raw SQL) and owns the transaction the domain layer used to hold directly.
+
+The check/consume path (`checkAndConsume`) wraps the whole read-decide-write sequence, across every
+limit of every check in a batch, in one `BEGIN IMMEDIATE` transaction — SQLite's single writer makes
+this genuinely all-or-nothing even across several processes sharing the file, not just within one
+process (`PRAGMA busy_timeout = 5000` absorbs a second writer's wait; past that it fails loudly with
+`SQLITE_BUSY` rather than silently interleaving). What would still diverge across several instances
+sharing one file is process-local state (`/metrics`' decision tally, each instance's readiness cache),
+never the counters themselves.
+
+**`release()` — the window-boundary fix.** Before this stage, `release()` always decremented the
+*current* window at release time, not the window the original check had consumed; a release arriving
+after a window boundary either hit the wrong bucket or a fresh one that was never incremented, so the
+refund was silently lost. `release()` now accepts an optional `consumedAt` (every check's `Decision`
+returns one), and decrements the window that instant falls in — deterministic regardless of how much
+time passed before the release arrives. Omitting `consumedAt` targets the current window, same as the
+old behavior; that is only correct when the release happens inside the same window it consumed. A
+counter is clamped at zero on every release, however many times or with however large a cost it is
+called — never negative, never more than a limit's own window can hold.
+
+**Multi-process, one host: yes. Distributed: no.** `SqliteCounterBackend` serializes writers at the
+SQLite *file* level — correct for several processes on one host sharing one `DB_PATH`, which is the
+supported topology (class B, see [docs/READINESS.md](docs/READINESS.md)). It is not a distributed
+counter: two processes pointed at two different files, or the same file over a network filesystem
+(where SQLite's locking is unreliable), do not share a rate limit, and nothing here detects that
+misconfiguration.
+
+**Clock model.** Every window boundary is `floor(now / windowMs) * windowMs` against the service's
+own wall clock (`Date.now`, injectable for tests) — not a monotonic clock, since window membership
+has to be anchored to fixed epoch multiples that stay meaningful across a restart and (for a future
+Redis backend) across instances; a monotonic clock has no such fixed relationship to wall time. Clock
+skew *between callers* (gateway instances, other services) is irrelevant: only the ratelimit
+process's own clock decides which window a request lands in. If that clock jumps backward, a check
+can land in an already-used window and read stale counts — never denies more than the limit allows,
+never goes negative; if it jumps forward, in-flight windows are skipped and age out via `cleanup()`
+like any other expired window. Keep the host's clock NTP-synced; nothing here corrects for skew on
+its own.
+
+**A future Redis backend** would need exactly one atomic server-side operation in place of
+`checkAndConsume`'s SQLite transaction: a Lua script (or Redis Function) that, for every check in the
+batch, reads `prev`/`cur` for every limit, evaluates all of them, and — only if every one of them
+allows its cost — issues the `INCRBY`s; anything less than one atomic operation across the *whole
+batch* reintroduces the same partial-consumption bug the SQLite transaction exists to prevent.
+`release()` needs a second, simpler atomic operation: a bounded `DECRBY` (clamped at zero) against the
+window `consumedAt` selects. Neither is implemented; see `domain/counter-backend.js` for the
+atomicity every method requires from any backend, SQLite or not, and
+`test/backend-contract.test.js` for the suite a Redis backend would need to pass unchanged.
+
+See [docs/READINESS.md](docs/READINESS.md) for the full contract.
 
 ## Observability
 

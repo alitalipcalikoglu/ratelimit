@@ -23,18 +23,16 @@ export class RateLimitApi {
    * @param {import('../domain/rate-limit-service.js').RateLimitService} deps.service
    * @param {import('../store/policy-store.js').PolicyStore} deps.policies
    * @param {import('../store/override-store.js').OverrideStore} deps.overrides
-   * @param {import('../store/counter-store.js').CounterStore} deps.counters
    * @param {import('../db.js').Database} deps.db
    * @param {import('../types.js').Logger} [deps.logger]
    * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
    */
-  constructor({ config, audit, service, policies, overrides, counters, db, logger }) {
+  constructor({ config, audit, service, policies, overrides, db, logger }) {
     this.config = config;
     this.audit = audit;
     this.service = service;
     this.policies = policies;
     this.overrides = overrides;
-    this.counters = counters;
     this.db = db;
     this.logger = logger;
     this.auth = new ApiKeyAuth(config.apiKeys);
@@ -90,7 +88,7 @@ export class RateLimitApi {
     const visible = (/** @type {FastifyRequest} */ r) => { const scope = r.apiKey.policies; return this.policies.all().filter((p) => !scope || scope.includes(p.name)); };
     const view = (/** @type {import('../types.js').PolicyRow} */ p) => {
       const t = s.totals24h().get(p.name);
-      return Views.policy(p, { overrides: this.overrides.count(p.name), subjects: this.counters.activeSubjects(p.name, s.now()), allowed: t?.allowed, denied: t?.denied });
+      return Views.policy(p, { overrides: this.overrides.count(p.name), subjects: s.activeSubjects(p.name), allowed: t?.allowed, denied: t?.denied });
     };
 
     // ---- checks
@@ -106,7 +104,7 @@ export class RateLimitApi {
       return { allowed: r.allowed, results: r.results.map(Views.decision) };
     });
     api.post('/release', { ...check, schema: { body: Schemas.release } }, async (request) => {
-      const b = /** @type {{ policy: string, subject: string, cost?: number }} */ (request.body);
+      const b = /** @type {{ policy: string, subject: string, cost?: number, consumedAt?: string }} */ (request.body);
       ApiKeyAuth.assertPolicy(request.apiKey, b.policy);
       return Views.decision(s.release(b));
     });
@@ -153,7 +151,7 @@ export class RateLimitApi {
 
     api.get('/stats', read, async (request) => {
       const items = visible(request).map(view);
-      return { policies: items.length, last24h: { allowed: items.reduce((a, p) => a + p.last24h.allowed, 0), denied: items.reduce((a, p) => a + p.last24h.denied, 0) }, counters: this.counters.total(), dbBytes: this.db.sizeBytes(), items: items.map((p) => ({ name: p.name, limits: p.limits, overrides: p.overrides, activeSubjects: p.activeSubjects, last24h: p.last24h })) };
+      return { policies: items.length, last24h: { allowed: items.reduce((a, p) => a + p.last24h.allowed, 0), denied: items.reduce((a, p) => a + p.last24h.denied, 0) }, counters: s.counterTotal(), dbBytes: this.db.sizeBytes(), items: items.map((p) => ({ name: p.name, limits: p.limits, overrides: p.overrides, activeSubjects: p.activeSubjects, last24h: p.last24h })) };
     });
   }
 
@@ -173,7 +171,7 @@ export class RateLimitApi {
         ...all.flatMap((p) => [`ratelimit_decisions_total{policy="${p.name}",decision="allowed"} ${tally.get(p.name)?.allowed ?? 0}`, `ratelimit_decisions_total{policy="${p.name}",decision="denied"} ${tally.get(p.name)?.denied ?? 0}`]),
         '# HELP ratelimit_counters Live window counters.',
         '# TYPE ratelimit_counters gauge',
-        `ratelimit_counters ${this.counters.total()}`,
+        `ratelimit_counters ${this.service.counterTotal()}`,
         '# HELP ratelimit_db_bytes Database size.',
         '# TYPE ratelimit_db_bytes gauge',
         `ratelimit_db_bytes ${this.db.sizeBytes()}`,

@@ -7,6 +7,7 @@ import { RateLimitApi } from './http/rate-limit-api.js';
 import { CounterStore } from './store/counter-store.js';
 import { OverrideStore } from './store/override-store.js';
 import { PolicyStore } from './store/policy-store.js';
+import { SqliteCounterBackend } from './store/sqlite-counter-backend.js';
 import { CleanupWorker } from './worker.js';
 
 /** Composition root: wires configuration, storage, domain, HTTP and the cleanup worker; owns the process lifecycle. */
@@ -18,8 +19,8 @@ export class Application {
     this.db = new Database(config.dbPath, { backupDir: config.dbBackupDir });
     this.policies = new PolicyStore(this.db);
     this.overrides = new OverrideStore(this.db);
-    this.counters = new CounterStore(this.db);
-    this.service = new RateLimitService({ db: this.db, policies: this.policies, overrides: this.overrides, counters: this.counters, options: config });
+    this.backend = new SqliteCounterBackend(this.db, new CounterStore(this.db));
+    this.service = new RateLimitService({ backend: this.backend, policies: this.policies, overrides: this.overrides, options: config });
     /** @type {import('fastify').FastifyInstance|null} */
     this.app = null;
     /** @type {CleanupWorker|null} */
@@ -43,7 +44,7 @@ export class Application {
 
   async start() {
     const { config } = this;
-    const api = new RateLimitApi({ config, audit: this.audit, service: this.service, policies: this.policies, overrides: this.overrides, counters: this.counters, db: this.db });
+    const api = new RateLimitApi({ config, audit: this.audit, service: this.service, policies: this.policies, overrides: this.overrides, db: this.db });
     const app = await api.build();
     this.app = app;
     const { shutdown } = Lifecycle.install({

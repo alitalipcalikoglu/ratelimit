@@ -5,6 +5,7 @@ import { RateLimitApi } from '../src/http/rate-limit-api.js';
 import { CounterStore } from '../src/store/counter-store.js';
 import { OverrideStore } from '../src/store/override-store.js';
 import { PolicyStore } from '../src/store/policy-store.js';
+import { SqliteCounterBackend } from '../src/store/sqlite-counter-backend.js';
 
 export const RW_KEY = 'k'.repeat(40);
 export const READ_KEY = 'r'.repeat(40);
@@ -37,8 +38,9 @@ export function testService(overrides) {
   const policies = new PolicyStore(db);
   const overridesStore = new OverrideStore(db);
   const counters = new CounterStore(db);
-  const service = new RateLimitService({ db, policies, overrides: overridesStore, counters, options: config, now: () => clock.t });
-  return { config, db, policies, overrides: overridesStore, counters, service, clock };
+  const backend = new SqliteCounterBackend(db, counters);
+  const service = new RateLimitService({ backend, policies, overrides: overridesStore, options: config, now: () => clock.t });
+  return { config, db, policies, overrides: overridesStore, counters, backend, service, clock };
 }
 
 /** Fully wired Fastify app. @param {Record<string, string>} [overrides] @param {object} [deps] Extra constructor deps, e.g. an AuditClient. */
