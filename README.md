@@ -74,13 +74,23 @@ Errors are JSON: `{ "error": { "code", "message", "details?" } }`.
 | GET | `/v1/stats` | read | Totals and per-policy 24 h numbers. |
 | GET | `/metrics` | read | Prometheus text: policies, decisions since start, counters, database size, uptime. |
 
-Examples for every feature, with requests and responses: [examples/README.md](examples/README.md).
+## Examples
+
+Scenario walkthroughs for every feature live in [examples/](examples/README.md).
 
 ## Configuration
 
 Environment only; see [.env.example](.env.example). Required: `RATELIMIT_API_KEYS`. Notable: `MAX_LIMITS` (windows per policy), `MAX_WINDOW_SEC`, `MAX_COST`, `MAX_BATCH`, `CLEANUP_INTERVAL_SEC`, `STATS_RETENTION_DAYS`, `RATE_LIMIT_MAX` (the service's own per-key limit), `TRUST_PROXY`, `TLS_CERT_PATH` / `TLS_KEY_PATH`.
 
-## Layout
+## Security notes
+
+- API keys: compared in constant time against every configured key (SHA-256 digest + `timingSafeEqual`, no early exit), so timing never reveals whether, or which, key matched (`@atc-web/service-core/auth`, `ApiKeyAuth`).
+- Roles: `check`/`read`/`write`/`readwrite`, enforced per route (`ApiKeyAuth.require`). A policy scope on a key (`id:secret:role:policy+policy`) additionally restricts it to those policies — `ApiKeyAuth.assertPolicy` runs on every route that names a policy and returns `403 FORBIDDEN` for one outside the key's scope; an unscoped key can see and touch every policy.
+- The service rate-limits itself per key (`RATE_LIMIT_MAX` per minute, `@fastify/rate-limit`, keyed on the caller's API key id) in addition to the limits it hands out to callers.
+- Request bodies capped at `BODY_LIMIT` (default 64 KiB); `Cache-Control: no-store` on every response.
+- Container runs as the unprivileged `node` user.
+
+## Code layout
 
 ```
 src/
@@ -99,7 +109,7 @@ test/                       node:test suites (config, domain, service, API, TLS)
 examples/                   one walkthrough per feature
 ```
 
-## Out of scope
+## Out of scope by design
 
 - Distributed counters across several instances of this service: one process owns one database. Split policies across instances instead.
 - Token-bucket or leaky-bucket shaping. The sliding window covers limits and quotas; smoothing at sub-second granularity belongs in the caller.
@@ -168,7 +178,7 @@ See [docs/READINESS.md](docs/READINESS.md) for the full contract.
 ## Observability
 
 Requests are logged with `reqId` (accepts or generates `X-Request-Id`; no `traceparent` support —
-gateway-only so far). `/health` is a static check; `/ready` pings the database, cached for 10s. Note
+implemented in `gateway` and `console` (Stage 10), not here). `/health` is a static check; `/ready` pings the database, cached for 10s. Note
 that `/metrics`' `ratelimit_decisions_total` is a process-local counter that resets on restart and
 can disagree with the durable totals `/v1/stats` reports from the `decisions` table. See
 [docs/READINESS.md](docs/READINESS.md) for the full contract.
