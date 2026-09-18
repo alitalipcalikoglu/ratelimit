@@ -1,0 +1,1483 @@
+openapi: 3.1.0
+info:
+  title: ratelimit
+  version: "1.0.0"
+  description: >-
+    Central rate limits and quotas for every service in the atc-web platform: named policies with
+    several sliding windows, per-subject overrides and hard blocks, one atomic check per request or
+    per group, usage and decision statistics. SQLite, no external store. Consumed primarily by
+    gateway and other backend services, gated only by API-key possession (no separate network
+    tier).
+
+
+    **Read this before integrating `POST /v1/check` or `POST /v1/check/batch`**: a rate-limit
+    *denial* is a normal, successful HTTP response. These two endpoints (and `POST /v1/release`)
+    always return HTTP `200` for a well-formed, authorized request — whether the business decision
+    is `allowed: true` or `allowed: false` is carried entirely in the JSON body's `allowed` field
+    (and, for a batch, in each result's own `allowed` field plus the top-level `allowed`). An HTTP
+    `429` from this service means something completely different: it is `ratelimit`'s own
+    self-throttle (`@fastify/rate-limit`, keyed by API-key id, scoped to the whole `/v1` sub-app)
+    protecting the service itself from being called too often — it has nothing to do with any
+    policy's own limits. Do not branch on HTTP status to detect a rate-limit denial; branch on the
+    response body's `allowed` field. See each operation below for the exact per-endpoint wording,
+    and `components.responses.RateLimited` for the self-throttle's own contract (including its
+    `Retry-After` header, which — unlike the domain-level `retryAfter` body field on every
+    `Decision` — is the *only* place this service ever sets a `Retry-After` HTTP header).
+security:
+  - ApiKeyAuth: []
+paths:
+  /health:
+    get:
+      operationId: ratelimit.health.check
+      summary: Liveness check
+      description: Always returns 200 once the process is accepting connections. No dependency checks.
+      x-stack-visibility: public
+      security: []
+      responses:
+        '200':
+          description: Process is up.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /ready:
+    get:
+      operationId: ratelimit.ready.check
+      summary: Readiness check
+      description: >-
+        Pings the SQLite database (`db.ping()`); result cached 10s. 200 when the ping succeeds, 503
+        otherwise. No `extra` fields are merged into the healthy body — the response is exactly
+        `{status:'ok'}`.
+      x-stack-visibility: public
+      security: []
+      responses:
+        '200':
+          description: Database ping succeeded (within the last 10s).
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+        '503':
+          description: Database ping failed (within the last 10s).
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+  /v1/info:
+    get:
+      operationId: ratelimit.info.get
+      summary: Service identity and capabilities
+      description: >-
+        Static identity and capability information. Registered directly on the app, outside the
+        `/v1` sub-app that carries API-key auth and the self-throttle — unauthenticated and never
+        rate-limited, despite the `/v1` prefix in its path.
+      x-stack-visibility: public
+      security: []
+      responses:
+        '200':
+          description: Identity and capability information.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InfoResponse'
+  /metrics:
+    get:
+      operationId: ratelimit.metrics.get
+      summary: Prometheus metrics
+      description: >-
+        Prometheus text exposition format: policy count, decisions since process start per policy
+        and decision, live counter-row count, database size, process uptime. Requires a `read` (or
+        `readwrite`) API key. Registered as its own plugin, outside the `/v1` sub-app — authenticated
+        like every other route, but **exempt from the self-throttle** (the `@fastify/rate-limit`
+        plugin only wraps `/v1`), the same platform-wide convention every service with a `/metrics`
+        route follows so a fixed-schedule Prometheus scraper is never itself throttled.
+      x-stack-visibility: operational
+      x-required-role: read
+      responses:
+        '200':
+          description: Metrics rendered as Prometheus text.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            text/plain; version=0.0.4; charset=utf-8:
+              schema:
+                type: string
+                description: Prometheus text exposition format.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/check:
+    post:
+      operationId: ratelimit.check
+      summary: Check and consume one subject's quota against one policy
+      description: >-
+        Evaluates every window of the effective limit set (the subject's active override, if any,
+        else the policy's own limits) and, unless `peek: true`, atomically consumes `cost` units
+        (default 1) when every window allows it — a denied check never consumes anything.
+
+
+        **HTTP `200` is returned for both an allow and a deny.** The business decision is the body's
+        `allowed` field, never the HTTP status. This is deliberate, not an oversight: only this
+        service's own self-throttle (see `components.responses.RateLimited`) ever produces an HTTP
+        `429` here, and it is a completely separate mechanism from a policy's own limit — a `429`
+        means "you called `ratelimit` itself too often," never "this subject is over its policy
+        limit." No `Retry-After` HTTP header is ever set for a business-level denial; the
+        domain-level `retryAfter` on the returned `Decision` is body-only.
+
+
+        Requires a `check` (or `readwrite`) API key, scoped to the target policy (a key with a
+        `policies` allowlist that does not include `policy` gets `403 FORBIDDEN`, checked before the
+        policy is even looked up).
+      x-required-role: check
+      x-policy-scoped: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckRequest'
+      responses:
+        '200':
+          description: >-
+            The check was evaluated — `allowed` may be `true` or `false`; both are a normal `200`,
+            never an HTTP `429`. `blocked: true` means the effective limits include a `limit: 0`
+            window, i.e. this subject is hard-blocked regardless of remaining budget elsewhere.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Decision'
+        '400':
+          description: Validation failed, or the cost could never fit one of the effective windows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PolicyNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/check/batch:
+    post:
+      operationId: ratelimit.checkBatch
+      summary: Check and consume several (policy, subject) pairs as one atomic unit
+      description: >-
+        Same all-or-nothing atomicity and the same `200`-even-when-denied contract as `POST
+        /v1/check` (see that operation's description — it applies identically here): the top-level
+        `allowed` and every `results[i].allowed` are body-level business decisions, never reflected
+        in the HTTP status, and never produce an HTTP `429` by themselves. Counters move only when
+        **every** check in the batch allows its cost; if any one is denied, every result in the
+        response comes back with `allowed: false` (the ones that individually would have passed are
+        still reported as not-allowed, since nothing was consumed for them either).
+
+
+        Requires a `check` (or `readwrite`) API key, scoped to every policy named in `checks` (the
+        first out-of-scope policy found gets `403 FORBIDDEN`).
+
+
+        `400 DUPLICATE_CHECK` is a genuinely overloaded error code with two unrelated trigger
+        conditions — do not assume it always means a literal duplicate: (1) the batch has more than
+        `MAX_BATCH` entries (config-configurable, default 20 — note the request body schema itself
+        allows up to 100 entries, so a batch that passes JSON-Schema validation can still be
+        rejected here), or (2) the same `(policy, subject)` pair appears twice in `checks`.
+      x-required-role: check
+      x-policy-scoped: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckBatchRequest'
+      responses:
+        '200':
+          description: >-
+            Every check in the batch was evaluated. `allowed` (top-level) is true only if every
+            entry in `results` was allowed; a `200` is returned regardless, never a `429`.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckBatchResponse'
+        '400':
+          description: >-
+            Validation failed, a cost could never fit one of the effective windows
+            (`COST_TOO_HIGH`), or `DUPLICATE_CHECK` — see this operation's description for its two
+            distinct trigger conditions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PolicyNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/release:
+    post:
+      operationId: ratelimit.release
+      summary: Give back units consumed by an earlier check
+      description: >-
+        For an operation that consumed quota via `POST /v1/check` and then itself failed, releases
+        `cost` units (default 1) back into the window they were actually consumed from.
+        `consumedAt`, when given, should be the `consumedAt` value the original `Decision` returned —
+        this targets the window that was truly consumed even after it has rolled over; omitting it
+        targets whichever window `now` falls in, which is only correct when the release happens
+        inside the same window the original check consumed. Evaluated at `now`, and — like `/check`
+        and `/check/batch` — always `200`, with the resulting `Decision` reflecting the state after
+        the release; there is no failure mode here that maps to a body-level `allowed: false`
+        distinct from the returned decision's own fields.
+
+
+        Requires a `check` (or `readwrite`) API key, scoped to the target policy.
+      x-required-role: check
+      x-policy-scoped: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseRequest'
+      responses:
+        '200':
+          description: State after the release, evaluated at `now`.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Decision'
+        '400':
+          description: Validation failed, cost out of range, or `consumedAt` is not a valid ISO 8601 date.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PolicyNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/policies:
+    post:
+      operationId: ratelimit.policies.create
+      summary: Create a policy
+      description: >-
+        Requires a `write` (or `readwrite`) API key, scoped to the new policy's own name. Returns
+        `Location: /v1/policies/{name}` on success.
+      x-required-role: write
+      x-policy-scoped: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePolicyRequest'
+      responses:
+        '201':
+          description: Policy created.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PolicyResponse'
+        '400':
+          description: Validation failed, or `limits` is invalid (see `INVALID_LIMITS`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/PolicyExists'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    get:
+      operationId: ratelimit.policies.list
+      summary: List policies visible to this API key
+      description: >-
+        Requires a `read` (or `readwrite`) API key. Filtered to the key's own `policies` scope when
+        it has one (`policies: null` on the key sees every policy). Never scope-forbidden — an
+        out-of-scope policy is silently omitted rather than causing a `403`.
+      x-required-role: read
+      responses:
+        '200':
+          description: Policies visible to this key.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PoliciesListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/policies/{name}:
+    get:
+      operationId: ratelimit.policies.get
+      summary: Get one policy
+      description: Requires a `read` (or `readwrite`) API key, scoped to this policy.
+      x-required-role: read
+      x-policy-scoped: true
+      parameters:
+        - $ref: '#/components/parameters/PolicyName'
+      responses:
+        '200':
+          description: The policy.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PolicyResponse'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PolicyNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    patch:
+      operationId: ratelimit.policies.patch
+      summary: Update a policy's description and/or limits
+      description: >-
+        Requires a `write` (or `readwrite`) API key, scoped to this policy. At least one of
+        `description`/`limits` must be given. Existing overrides and counters are unaffected by a
+        limits change; only future checks are evaluated against the new limits.
+      x-required-role: write
+      x-policy-scoped: true
+      parameters:
+        - $ref: '#/components/parameters/PolicyName'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchPolicyRequest'
+      responses:
+        '200':
+          description: The updated policy.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PolicyResponse'
+        '400':
+          description: Validation failed (including an empty patch body), or `limits` is invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PolicyNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    delete:
+      operationId: ratelimit.policies.delete
+      summary: Delete a policy
+      description: >-
+        Requires a `write` (or `readwrite`) API key, scoped to this policy. Deletes the policy along
+        with its overrides, counters and statistics. No response body.
+      x-required-role: write
+      x-policy-scoped: true
+      parameters:
+        - $ref: '#/components/parameters/PolicyName'
+      responses:
+        '204':
+          description: Policy deleted.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PolicyNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/policies/{name}/stats:
+    get:
+      operationId: ratelimit.policies.getStats
+      summary: Hourly allowed/denied series for a policy
+      description: >-
+        Requires a `read` (or `readwrite`) API key, scoped to this policy. Hourly series for the
+        last `hours` hours (default 24, max 720 = 30 days), gaps filled with zeros.
+      x-required-role: read
+      x-policy-scoped: true
+      parameters:
+        - $ref: '#/components/parameters/PolicyName'
+        - name: hours
+          in: query
+          required: false
+          description: Number of trailing hours to report, 1-720. Default 24.
+          schema:
+            type: string
+            pattern: '^([1-9]|[1-9][0-9]|[1-6][0-9][0-9]|7[0-1][0-9]|720)$'
+            example: "24"
+      responses:
+        '200':
+          description: Hourly allowed/denied series.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsResponse'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PolicyNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/policies/{name}/top:
+    get:
+      operationId: ratelimit.policies.getTop
+      summary: Subjects with the highest usage in one window of a policy
+      description: >-
+        Requires a `read` (or `readwrite`) API key, scoped to this policy. `window` defaults to the
+        policy's first (shortest) configured window when omitted; a `window` value that is not one
+        of the policy's configured windows is `400 UNKNOWN_WINDOW`.
+      x-required-role: read
+      x-policy-scoped: true
+      parameters:
+        - $ref: '#/components/parameters/PolicyName'
+        - name: window
+          in: query
+          required: false
+          description: Window size in seconds, must match one of the policy's configured windows. Defaults to the policy's shortest window.
+          schema:
+            type: string
+            pattern: '^[1-9][0-9]{0,7}$'
+        - name: limit
+          in: query
+          required: false
+          description: Maximum subjects to return, 1-1000. Default 20.
+          schema:
+            type: string
+            pattern: '^([1-9]|[1-9][0-9]|[1-9][0-9][0-9]|1000)$'
+      responses:
+        '200':
+          description: Top subjects by usage in the resolved window.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TopResponse'
+        '400':
+          description: Validation failed, or `window` does not match any configured window (`UNKNOWN_WINDOW`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PolicyNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/policies/{name}/overrides:
+    get:
+      operationId: ratelimit.overrides.list
+      summary: List a policy's subject overrides
+      description: Requires a `read` (or `readwrite`) API key, scoped to this policy. Offset-paginated.
+      x-required-role: read
+      x-policy-scoped: true
+      parameters:
+        - $ref: '#/components/parameters/PolicyName'
+        - name: limit
+          in: query
+          required: false
+          description: Page size, 1-1000. Default 50.
+          schema:
+            type: string
+            pattern: '^([1-9]|[1-9][0-9]|[1-9][0-9][0-9]|1000)$'
+        - name: offset
+          in: query
+          required: false
+          description: Rows to skip. Default 0.
+          schema:
+            type: string
+            pattern: '^(0|[1-9][0-9]{0,6})$'
+      responses:
+        '200':
+          description: Overrides for this policy.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OverridesListResponse'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PolicyNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/policies/{name}/overrides/{subject}:
+    put:
+      operationId: ratelimit.overrides.set
+      summary: Create or replace a subject's override
+      description: >-
+        Requires a `write` (or `readwrite`) API key, scoped to this policy. Upsert — always
+        succeeds when the policy exists and the body is valid, whether or not an override already
+        exists for this subject (never `409`). A `limits` entry with `limit: 0` hard-blocks the
+        subject on that window.
+      x-required-role: write
+      x-policy-scoped: true
+      parameters:
+        - $ref: '#/components/parameters/PolicyName'
+        - $ref: '#/components/parameters/Subject'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OverrideRequest'
+      responses:
+        '200':
+          description: The override as stored.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OverrideResponse'
+        '400':
+          description: >-
+            Validation failed, `limits` is invalid (`INVALID_LIMITS`), or `expiresAt` is not a
+            future ISO 8601 date (also `INVALID_LIMITS`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PolicyNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    delete:
+      operationId: ratelimit.overrides.delete
+      summary: Remove a subject's override
+      description: >-
+        Requires a `write` (or `readwrite`) API key, scoped to this policy. `404 OVERRIDE_NOT_FOUND`
+        when no override exists for this subject (checked after the policy itself is confirmed to
+        exist, so a missing policy still yields `404 POLICY_NOT_FOUND`).
+      x-required-role: write
+      x-policy-scoped: true
+      parameters:
+        - $ref: '#/components/parameters/PolicyName'
+        - $ref: '#/components/parameters/Subject'
+      responses:
+        '204':
+          description: Override removed.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: The policy does not exist (`POLICY_NOT_FOUND`), or it exists but has no override for this subject (`OVERRIDE_NOT_FOUND`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/policies/{name}/subjects/{subject}:
+    get:
+      operationId: ratelimit.subjects.getUsage
+      summary: Current usage of one subject, without consuming
+      description: >-
+        Requires a `read` (or `readwrite`) API key, scoped to this policy. A peek: `remaining` in
+        the returned `usage.limits[]` is what is left right now, and no counters are touched. Also
+        returns the subject's active override, if any.
+      x-required-role: read
+      x-policy-scoped: true
+      parameters:
+        - $ref: '#/components/parameters/PolicyName'
+        - $ref: '#/components/parameters/Subject'
+      responses:
+        '200':
+          description: Current usage and, if present, the active override.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubjectUsageResponse'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PolicyNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/policies/{name}/subjects/{subject}/usage:
+    delete:
+      operationId: ratelimit.subjects.resetUsage
+      summary: Forget every counter of a subject
+      description: >-
+        Requires a `write` (or `readwrite`) API key, scoped to this policy. Unlike the other
+        deletes in this API, this returns `200` with the count of counter rows removed, not `204` —
+        there is no separate resource whose absence a `204` would represent, only a count.
+      x-required-role: write
+      x-policy-scoped: true
+      parameters:
+        - $ref: '#/components/parameters/PolicyName'
+        - $ref: '#/components/parameters/Subject'
+      responses:
+        '200':
+          description: Counters removed.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResetUsageResponse'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PolicyNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/stats:
+    get:
+      operationId: ratelimit.stats.get
+      summary: Aggregate statistics across every policy visible to this API key
+      description: >-
+        Requires a `read` (or `readwrite`) API key. Scoped the same way as `GET /v1/policies` — only
+        policies within the key's own `policies` allowlist (or every policy, when unscoped)
+        contribute to the totals and `items`.
+      x-required-role: read
+      responses:
+        '200':
+          description: Aggregate statistics.
+          headers:
+            X-Content-Type-Options:
+              $ref: '#/components/headers/XContentTypeOptions'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GlobalStatsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        `Authorization: Bearer <secret>`. Keys come from the `RATELIMIT_API_KEYS` environment
+        variable (`id:secret[:role[:policy+policy]]`), compared in constant time against every
+        configured key (no early exit on match). Each key carries:
+
+
+        - a **role** — `check`, `read`, `write` or `readwrite` (default when omitted). A route
+          declares the role it needs (see each operation's `x-required-role`); a key satisfies a
+          requirement of `need` when its own role is either `need` itself or `readwrite` —
+          `readwrite` is the only role that satisfies every requirement, `check`/`read`/`write` each
+          satisfy only themselves. There is no partial overlap (e.g. `write` does NOT imply `read`).
+          `POST /v1/check`, `POST /v1/check/batch` and `POST /v1/release` specifically require
+          `check` (or `readwrite`) — a `read`- or `write`-only key gets `403 FORBIDDEN` on those
+          three routes even though it may be valid for other routes.
+        - an optional **policy scope** — `policies: string[]|null` (`null` = every policy, the
+          default when no policy list is given in the env value). Every route that names a policy
+          (by path parameter or by a `policy` field in the request body) additionally requires the
+          key's scope to include that policy name, on top of satisfying the role check above;
+          out-of-scope also yields `403 FORBIDDEN` (message text distinguishes "no `<role>` access"
+          from "no access to policy `<name>`", but the HTTP status and error `code` are identical).
+
+
+        401 body is always `{"error":{"code":"UNAUTHORIZED","message":"missing or invalid API key"}}`
+        with a `WWW-Authenticate: Bearer` header; 403 is always
+        `{"error":{"code":"FORBIDDEN","message":"..."}}`.
+  parameters:
+    PolicyName:
+      name: name
+      in: path
+      required: true
+      description: Policy name.
+      schema:
+        $ref: '#/components/schemas/PolicyNameValue'
+    Subject:
+      name: subject
+      in: path
+      required: true
+      description: Subject identifier (opaque to this service — a user id, an IP, an API key id, ...).
+      schema:
+        $ref: '#/components/schemas/SubjectValue'
+  headers:
+    XContentTypeOptions:
+      description: Always set by ratelimit's response hook.
+      schema:
+        type: string
+        const: nosniff
+    CacheControl:
+      description: Always set by ratelimit's response hook.
+      schema:
+        type: string
+        const: no-store
+    WWWAuthenticate:
+      description: Present on every 401 response.
+      schema:
+        type: string
+        const: Bearer
+    Location:
+      description: Path of the newly created policy.
+      schema:
+        type: string
+        example: /v1/policies/my-policy
+    RetryAfter:
+      description: >-
+        Seconds until the self-throttle window resets. Set **only** on the self-throttle's own
+        `429` — never on a `200` business-level denial (that `retryAfter` is body-only, on the
+        returned `Decision`/`LimitState`).
+      schema:
+        type: integer
+        minimum: 0
+    XRateLimitLimit:
+      description: The self-throttle's configured max requests per window (`RATE_LIMIT_MAX`, default 6000/minute). Set only on the self-throttle's own `429`.
+      schema:
+        type: integer
+    XRateLimitRemaining:
+      description: Always `0` on the self-throttle's own `429` (the response that reports the limit was just exceeded).
+      schema:
+        type: integer
+        const: 0
+    XRateLimitReset:
+      description: Seconds until the self-throttle window resets. Set only on the self-throttle's own `429`.
+      schema:
+        type: integer
+        minimum: 0
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            details:
+              anyOf:
+                - type: object
+                - type: array
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+    ReadyResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, unavailable]
+        error:
+          type: string
+          description: Present only when status is unavailable.
+    InfoResponse:
+      type: object
+      required: [service, version, apiVersion, capabilities, schemaVersion, serviceCore]
+      properties:
+        service:
+          type: string
+          const: ratelimit
+        version:
+          type: string
+          description: ratelimit's own package.json version.
+        apiVersion:
+          type: string
+          const: v1
+        capabilities:
+          type: array
+          description: Static list — always exactly these three, does not vary by deployment.
+          items:
+            type: string
+          example: [policy-windows, overrides, usage-stats]
+        schemaVersion:
+          type: integer
+          description: The database's current schema version (SQLite `PRAGMA user_version`).
+        serviceCore:
+          type: string
+          description: The @atc-web/service-core version actually running.
+    PolicyNameValue:
+      type: string
+      pattern: '^[a-z0-9]+([.\-_][a-z0-9]+)*$'
+      maxLength: 80
+      example: api.requests
+    SubjectValue:
+      type: string
+      minLength: 1
+      maxLength: 200
+      description: No control characters (0x00-0x1F, 0x7F).
+      example: user-42
+    Limit:
+      type: object
+      additionalProperties: false
+      required: [window, limit]
+      properties:
+        window:
+          type: integer
+          minimum: 1
+          description: Window size in seconds.
+        limit:
+          type: integer
+          minimum: 0
+          description: Units allowed per window. 0 hard-blocks every check against this window.
+    Limits:
+      type: array
+      minItems: 1
+      maxItems: 20
+      description: Sorted by window ascending once stored. Distinct windows only.
+      items:
+        $ref: '#/components/schemas/Limit'
+    LimitState:
+      type: object
+      required: [window, limit, used, remaining, allowed, resetAt, retryAfter]
+      description: State of one window for one subject, evaluated at the decision's `consumedAt`.
+      properties:
+        window:
+          type: integer
+          description: Window size in seconds.
+        limit:
+          type: integer
+        used:
+          type: number
+          description: Sliding-window usage estimate (weighted blend of the previous and current window's counts).
+        remaining:
+          type: number
+        allowed:
+          type: boolean
+          description: Whether the requested cost fit in this window alone.
+        resetAt:
+          type: string
+          format: date-time
+          description: End of the current window.
+        retryAfter:
+          type: [integer, "null"]
+          description: Seconds until the requested cost would fit. Null when this window is hard-blocked (limit 0).
+    Decision:
+      type: object
+      required: [policy, subject, allowed, cost, source, blocked, limit, remaining, resetAt, retryAfter, limits, consumedAt]
+      description: >-
+        The result of a check, batch-check entry, or release. `limit`/`remaining`/`resetAt`/`retryAfter`
+        summarize the single most restrictive window in `limits` (least `remaining` when allowed;
+        the blocked or longest-wait window when denied) — always inspect `limits[]` directly for
+        per-window detail.
+      properties:
+        policy:
+          type: string
+        subject:
+          type: string
+        allowed:
+          type: boolean
+          description: The business decision. HTTP status is always 200 regardless of this value.
+        cost:
+          type: integer
+          description: Units this decision consumed (0 for a peek or a release).
+        source:
+          type: string
+          enum: [policy, override]
+          description: Whether the effective limits came from the policy itself or an active subject override.
+        blocked:
+          type: boolean
+          description: True when the effective limits include a limit-0 window (a hard block), independent of `allowed`.
+        limit:
+          type: integer
+          description: Limit of the most restrictive window.
+        remaining:
+          type: number
+        resetAt:
+          type: string
+          format: date-time
+        retryAfter:
+          type: [integer, "null"]
+          description: >-
+            Seconds until this subject's most restrictive window would allow the cost; 0 when
+            `allowed`. Body-only — never mirrored as an HTTP `Retry-After` header for a
+            business-level decision.
+        limits:
+          type: array
+          items:
+            $ref: '#/components/schemas/LimitState'
+        consumedAt:
+          type: string
+          format: date-time
+          description: >-
+            The instant this decision was evaluated at. Pass back as `release`'s `consumedAt` to
+            target the window that was actually consumed, even after it has rolled over.
+    CheckInput:
+      type: object
+      additionalProperties: false
+      required: [policy, subject]
+      properties:
+        policy:
+          $ref: '#/components/schemas/PolicyNameValue'
+        subject:
+          $ref: '#/components/schemas/SubjectValue'
+        cost:
+          type: integer
+          minimum: 0
+          description: Units to consume. Default 1.
+    CheckRequest:
+      type: object
+      additionalProperties: false
+      required: [policy, subject]
+      properties:
+        policy:
+          $ref: '#/components/schemas/PolicyNameValue'
+        subject:
+          $ref: '#/components/schemas/SubjectValue'
+        cost:
+          type: integer
+          minimum: 0
+          description: Units to consume. Default 1.
+        peek:
+          type: boolean
+          description: Evaluate without consuming. Default false.
+    CheckBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [checks]
+      properties:
+        checks:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: Schema allows up to 100 entries; MAX_BATCH (default 20) is enforced at the domain layer — see this operation's description.
+          items:
+            $ref: '#/components/schemas/CheckInput'
+        peek:
+          type: boolean
+          description: Evaluate without consuming, for every entry. Default false.
+    CheckBatchResponse:
+      type: object
+      required: [allowed, results]
+      properties:
+        allowed:
+          type: boolean
+          description: True only if every entry in results was allowed.
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/Decision'
+    ReleaseRequest:
+      type: object
+      additionalProperties: false
+      required: [policy, subject]
+      properties:
+        policy:
+          $ref: '#/components/schemas/PolicyNameValue'
+        subject:
+          $ref: '#/components/schemas/SubjectValue'
+        cost:
+          type: integer
+          minimum: 1
+          description: Units to give back. Default 1.
+        consumedAt:
+          type: string
+          maxLength: 40
+          description: ISO 8601 instant the units were originally consumed at. Default now.
+    CreatePolicyRequest:
+      type: object
+      additionalProperties: false
+      required: [name, limits]
+      properties:
+        name:
+          $ref: '#/components/schemas/PolicyNameValue'
+        description:
+          type: string
+          maxLength: 500
+        limits:
+          $ref: '#/components/schemas/Limits'
+    PatchPolicyRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        description:
+          type: string
+          maxLength: 500
+        limits:
+          $ref: '#/components/schemas/Limits'
+    OverrideRequest:
+      type: object
+      additionalProperties: false
+      required: [limits]
+      properties:
+        limits:
+          $ref: '#/components/schemas/Limits'
+        note:
+          type: string
+          maxLength: 500
+        expiresAt:
+          type: [string, "null"]
+          maxLength: 40
+          description: ISO 8601 instant, must be in the future. Null or omitted means no expiry.
+    Policy:
+      type: object
+      required: [name, description, limits, overrides, activeSubjects, last24h, createdBy, createdAt, updatedAt]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        limits:
+          $ref: '#/components/schemas/Limits'
+        overrides:
+          type: integer
+          description: Count of active subject overrides for this policy.
+        activeSubjects:
+          type: integer
+          description: Distinct subjects with a live counter window right now.
+        last24h:
+          type: object
+          required: [allowed, denied]
+          properties:
+            allowed:
+              type: integer
+            denied:
+              type: integer
+        createdBy:
+          type: string
+          description: API key id that created this policy.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    Override:
+      type: object
+      required: [policy, subject, limits, blocked, note, expiresAt, expired, createdBy, createdAt, updatedAt]
+      properties:
+        policy:
+          type: string
+        subject:
+          type: string
+        limits:
+          $ref: '#/components/schemas/Limits'
+        blocked:
+          type: boolean
+          description: True when limits includes a limit-0 window.
+        note:
+          type: string
+        expiresAt:
+          type: [string, "null"]
+          format: date-time
+        expired:
+          type: boolean
+          description: True when expiresAt is set and in the past, as of the response's own evaluation instant.
+        createdBy:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    PolicyResponse:
+      type: object
+      required: [policy]
+      properties:
+        policy:
+          $ref: '#/components/schemas/Policy'
+    PoliciesListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Policy'
+    StatsResponse:
+      type: object
+      required: [hours, allowed, denied, series]
+      properties:
+        hours:
+          type: integer
+        allowed:
+          type: integer
+          description: Sum of allowed across the series.
+        denied:
+          type: integer
+          description: Sum of denied across the series.
+        series:
+          type: array
+          items:
+            type: object
+            required: [hour, allowed, denied]
+            properties:
+              hour:
+                type: string
+                format: date-time
+                description: Start of this hour bucket.
+              allowed:
+                type: integer
+              denied:
+                type: integer
+    TopResponse:
+      type: object
+      required: [window, limit, items]
+      properties:
+        window:
+          type: integer
+          description: The resolved window (seconds) these results were computed against.
+        limit:
+          type: integer
+          description: That window's configured limit.
+        items:
+          type: array
+          items:
+            type: object
+            required: [subject, used]
+            properties:
+              subject:
+                type: string
+              used:
+                type: number
+                description: Sliding-window usage estimate.
+    OverridesListResponse:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Override'
+        total:
+          type: integer
+          description: Total overrides for this policy, independent of limit/offset.
+        limit:
+          type: integer
+        offset:
+          type: integer
+    OverrideResponse:
+      type: object
+      required: [override]
+      properties:
+        override:
+          $ref: '#/components/schemas/Override'
+    SubjectUsageResponse:
+      type: object
+      required: [usage, override]
+      properties:
+        usage:
+          $ref: '#/components/schemas/Decision'
+        override:
+          oneOf:
+            - $ref: '#/components/schemas/Override'
+            - type: "null"
+    ResetUsageResponse:
+      type: object
+      required: [removed]
+      properties:
+        removed:
+          type: integer
+          description: Counter rows removed.
+    GlobalStatsResponse:
+      type: object
+      required: [policies, last24h, counters, dbBytes, items]
+      properties:
+        policies:
+          type: integer
+          description: Count of policies visible to this key.
+        last24h:
+          type: object
+          required: [allowed, denied]
+          properties:
+            allowed:
+              type: integer
+            denied:
+              type: integer
+        counters:
+          type: integer
+          description: Live counter rows across every policy (unscoped by key).
+        dbBytes:
+          type: integer
+          description: Database file size in bytes (unscoped by key).
+        items:
+          type: array
+          items:
+            type: object
+            required: [name, limits, overrides, activeSubjects, last24h]
+            properties:
+              name:
+                type: string
+              limits:
+                $ref: '#/components/schemas/Limits'
+              overrides:
+                type: integer
+              activeSubjects:
+                type: integer
+              last24h:
+                type: object
+                required: [allowed, denied]
+                properties:
+                  allowed:
+                    type: integer
+                  denied:
+                    type: integer
+  responses:
+    Unauthorized:
+      description: Bearer token missing or does not match any configured API key.
+      headers:
+        WWW-Authenticate:
+          $ref: '#/components/headers/WWWAuthenticate'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: missing or invalid API key
+    Forbidden:
+      description: >-
+        The API key's role does not satisfy this route's requirement, or (on a policy-scoped route)
+        the key's policies allowlist does not include the named policy.
+      headers:
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: FORBIDDEN
+              message: this API key has no access to policy "api.requests"
+    ValidationFailed:
+      description: Request failed JSON-Schema validation (path/query/body).
+      headers:
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: VALIDATION_FAILED
+              message: body/name must match pattern "^[a-z0-9]+([.\-_][a-z0-9]+)*$"
+              details:
+                - path: /name
+                  message: must match pattern "^[a-z0-9]+([.\-_][a-z0-9]+)*$"
+                  params: {}
+    PolicyNotFound:
+      description: No policy with this name exists.
+      headers:
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: POLICY_NOT_FOUND
+              message: 'policy "api.requests" not found'
+    PolicyExists:
+      description: A policy with this name already exists.
+      headers:
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: POLICY_EXISTS
+              message: 'policy "api.requests" already exists'
+    OverrideNotFound:
+      description: The policy exists but has no override for this subject.
+      headers:
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: OVERRIDE_NOT_FOUND
+              message: no override for "user-42" in policy "api.requests"
+    RateLimited:
+      description: >-
+        This service's own self-throttle (`@fastify/rate-limit`, keyed by API-key id, default 6000
+        requests/minute via `RATE_LIMIT_MAX`) rejected the request. Unrelated to any policy's own
+        limits — a `200` with `allowed: false` is how a policy-level denial is reported, never this
+        `429`. This is the only response in this API that ever carries a `Retry-After` header.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/XRateLimitLimit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/XRateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/XRateLimitReset'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: RATE_LIMITED
+              message: rate limit exceeded, retry in 1 minute
