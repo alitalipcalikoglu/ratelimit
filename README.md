@@ -177,8 +177,10 @@ See [docs/READINESS.md](docs/READINESS.md) for the full contract.
 
 ## Observability
 
-Requests are logged with `reqId` (accepts or generates `X-Request-Id`; no `traceparent` support —
-implemented in `gateway` and `console` (Stage 10), not here). `/health` is a static check; `/ready` pings the database, cached for 10s. Note
+Requests are logged with `reqId` (accepts or generates `X-Request-Id`) and `traceId`/`spanId` (a
+trusted inbound `traceparent`, gated on `TRUST_PROXY`, continues the caller's trace with a fresh
+span-id for this hop — `gateway`'s own `rate-limit-client.js` explicitly propagates its trace on
+every policy check; see [OBSERVABILITY.md](../stack/docs/OBSERVABILITY.md)). `/health` is a static check; `/ready` pings the database, cached for 10s. Note
 that `/metrics`' `ratelimit_decisions_total` is a process-local counter that resets on restart and
 can disagree with the durable totals `/v1/stats` reports from the `decisions` table. See
 [docs/READINESS.md](docs/READINESS.md) for the full contract.
