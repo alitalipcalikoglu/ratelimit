@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
-import { createErrorHandler, jsonParser, registerInfo, registerProbes, registerRequestContext, requestOptions } from '@atc-web/service-core/fastify';
+import { createErrorHandler, jsonParser, registerInfo, registerOpenApi, registerProbes, registerRequestContext, requestOptions } from '@atc-web/service-core/fastify';
 import { RateLimitError } from '../domain/errors.js';
 import { ApiKeyAuth } from './api-key-auth.js';
 import { Schemas } from './schemas.js';
@@ -62,6 +62,7 @@ export class RateLimitApi {
       reply.header('cache-control', 'no-store');
     });
     registerProbes(app, () => this.db.ping(), { cacheMs: RateLimitApi.READY_CACHE_MS });
+    registerOpenApi(app, new URL('../../openapi.yaml', import.meta.url));
     registerInfo(app, {
       service: 'ratelimit',
       version: this.version,
