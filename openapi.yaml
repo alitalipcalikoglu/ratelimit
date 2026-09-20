@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ratelimit
-  version: "1.0.0"
+  version: "1.1.0"
   description: >-
     Central rate limits and quotas for every service in the atc-web platform: named policies with
     several sliding windows, per-subject overrides and hard blocks, one atomic check per request or
