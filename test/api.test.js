@@ -6,6 +6,7 @@ import { CHECK_KEY, READ_KEY, RW_KEY, SHOP_KEY, WRITE_KEY, bearer, buildApp } fr
 
 const json = (/** @type {import('light-my-request').Response} */ r) => JSON.parse(r.body);
 const API = [{ window: 60, limit: 3 }, { window: 3600, limit: 5 }];
+const PACKAGE_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 test('API: probes, auth, roles and policy scoping', async (t) => {
   const { app } = await buildApp(undefined, { version: readServiceVersion(import.meta.url) });
@@ -20,7 +21,7 @@ test('API: probes, auth, roles and policy scoping', async (t) => {
   const infoBody = json(info);
   assert.deepEqual(
     [infoBody.service, infoBody.version, infoBody.apiVersion, infoBody.capabilities],
-    ['ratelimit', readServiceVersion(import.meta.url), 'v1', ['policy-windows', 'overrides', 'usage-stats']],
+    ['ratelimit', PACKAGE_VERSION, 'v1', ['policy-windows', 'overrides', 'usage-stats']],
   );
   assert.equal(typeof infoBody.schemaVersion, 'number');
   assert.equal(typeof infoBody.serviceCore, 'string');
